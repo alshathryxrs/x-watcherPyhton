@@ -282,7 +282,7 @@ async def monitor(account: dict) -> None:
                     ws_url,
                     headers=headers,
                     heartbeat=25,        # aiohttp sends ping every 25s — keeps Railway alive
-                    timeout=aiohttp.ClientWSTimeout(ws_receive=None),  # no receive timeout
+                    
                 ) as ws:
                     print(f"[{now()}] 🟢 {tag} ONLINE: Clearing backlog (1s)...")
                     await asyncio.sleep(1)
