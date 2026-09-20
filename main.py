@@ -5,6 +5,7 @@ import time
 import json
 import httpx
 import websockets
+import websockets.client
 from datetime import datetime
 
 # ==================== ACCOUNT CREDENTIALS ====================
@@ -39,6 +40,48 @@ USER_AGENT = (
 )
 
 HEARTBEAT_B64 = "DAACDAACAAAA"
+
+# ============================================================
+# DETECT WEBSOCKETS VERSION — pick the right connect() API
+# ============================================================
+
+WS_VERSION = tuple(int(x) for x in websockets.__version__.split(".")[:2])
+print(f"[boot] websockets version: {websockets.__version__}")
+
+def make_ws_connect(url: str, headers: dict):
+    """
+    Returns a websockets async context manager that works on:
+      v10.x — connect(uri, extra_headers=dict)
+      v11/12 — connect(uri, additional_headers=dict)
+      v13+   — connect(uri, additional_headers=dict)  [extra_headers removed]
+    We detect at runtime which kwarg is accepted.
+    """
+    major = WS_VERSION[0]
+    if major >= 13:
+        return websockets.connect(
+            url,
+            additional_headers=headers,
+            ping_interval=25,
+            ping_timeout=10,
+            open_timeout=15,
+        )
+    elif major >= 11:
+        return websockets.connect(
+            url,
+            additional_headers=headers,
+            ping_interval=25,
+            ping_timeout=10,
+            open_timeout=15,
+        )
+    else:
+        # v10 and below
+        return websockets.connect(
+            url,
+            extra_headers=headers,
+            ping_interval=25,
+            ping_timeout=10,
+            open_timeout=15,
+        )
 
 # ============================================================
 # HELPERS
@@ -83,97 +126,64 @@ async def send_ntfy(title: str, message: str, retries: int = 3) -> None:
             print(f"[{now()}] ntfy HTTP {r.status_code} attempt {attempt}/{retries}")
         except Exception as e:
             print(f"[{now()}] ntfy failed attempt {attempt}/{retries}: {e}")
-
         if attempt < retries:
-            await asyncio.sleep(2 * attempt)  # 2s, 4s
-
+            await asyncio.sleep(2 * attempt)
     print(f"[{now()}] ❌ ntfy gave up after {retries} attempts — {title!r}")
 
 # ============================================================
 # THRIFT BINARY PARSER
 # ============================================================
 
-def parse_thrift(buf: bytes, offset: int) -> tuple[dict, int]:
+def parse_thrift(buf: bytes, offset: int) -> tuple:
     fields: dict = {}
-
     while offset < len(buf):
         if offset + 3 > len(buf):
             break
-
         type_id = buf[offset]
         field   = struct.unpack_from(">H", buf, offset + 1)[0]
         offset += 3
-
         if type_id == 0:
             break
-
-        # STRING
         if type_id == 11:
-            if offset + 4 > len(buf):
-                break
+            if offset + 4 > len(buf): break
             length = struct.unpack_from(">I", buf, offset)[0]
             offset += 4
-            if offset + length > len(buf):
-                break
+            if offset + length > len(buf): break
             fields[field] = buf[offset:offset + length].decode("utf-8", errors="replace")
             offset += length
-
-        # STRUCT
         elif type_id == 12:
             inner, offset = parse_thrift(buf, offset)
             fields[field] = inner
-
-        # LIST
         elif type_id == 15:
-            if offset + 5 > len(buf):
-                break
-            elem_type = buf[offset]
-            offset += 1
-            count = struct.unpack_from(">I", buf, offset)[0]
-            offset += 4
+            if offset + 5 > len(buf): break
+            elem_type = buf[offset]; offset += 1
+            count = struct.unpack_from(">I", buf, offset)[0]; offset += 4
             lst = []
             for _ in range(count):
                 if elem_type == 12:
                     inner, offset = parse_thrift(buf, offset)
                     lst.append(inner)
                 elif elem_type == 11:
-                    if offset + 4 > len(buf):
-                        break
-                    length = struct.unpack_from(">I", buf, offset)[0]
-                    offset += 4
-                    if offset + length > len(buf):
-                        break
+                    if offset + 4 > len(buf): break
+                    length = struct.unpack_from(">I", buf, offset)[0]; offset += 4
+                    if offset + length > len(buf): break
                     lst.append(buf[offset:offset + length].decode("utf-8", errors="replace"))
                     offset += length
                 else:
                     break
             fields[field] = lst
-
-        # I64
         elif type_id == 10:
-            if offset + 8 > len(buf):
-                break
+            if offset + 8 > len(buf): break
             hi, lo = struct.unpack_from(">II", buf, offset)
-            fields[field] = hi * 4_294_967_296 + lo
-            offset += 8
-
-        # I32
+            fields[field] = hi * 4_294_967_296 + lo; offset += 8
         elif type_id == 8:
-            if offset + 4 > len(buf):
-                break
-            fields[field] = struct.unpack_from(">i", buf, offset)[0]
-            offset += 4
-
-        # BOOL
+            if offset + 4 > len(buf): break
+            fields[field] = struct.unpack_from(">i", buf, offset)[0]; offset += 4
         elif type_id == 2:
-            if offset >= len(buf):
-                break
-            fields[field] = buf[offset]
-            offset += 1
-
+            if offset >= len(buf): break
+            fields[field] = buf[offset]; offset += 1
         else:
             break
-
     return fields, offset
 
 # ============================================================
@@ -184,119 +194,69 @@ def try_parse_seen(buf: bytes) -> dict | None:
     try:
         root, _ = parse_thrift(buf, 0)
         outer = root.get(1)
-        if not outer:
-            return None
-
+        if not outer: return None
         reader_id = str(outer.get(3, ""))
-        if not reader_id or not reader_id.isdigit() or not (6 <= len(reader_id) <= 20):
-            return None
-
+        if not reader_id or not reader_id.isdigit() or not (6 <= len(reader_id) <= 20): return None
         conv_id = str(outer.get(4, ""))
-        if ":" not in conv_id:
-            return None
-
+        if ":" not in conv_id: return None
         f7 = outer.get(7)
-        if not f7:
-            return None
+        if not f7: return None
         f12 = f7.get(12)
-        if not f12:
-            return None
-
+        if not f12: return None
         seen_msg_id = f12.get(1)
         seen_at     = f12.get(2)
-        if not seen_msg_id or not seen_at:
-            return None
-
-        return {
-            "reader_id":    reader_id,
-            "conv_id":      conv_id,
-            "seen_msg_id":  str(seen_msg_id),
-            "seen_at":      seen_at,
-        }
+        if not seen_msg_id or not seen_at: return None
+        return {"reader_id": reader_id, "conv_id": conv_id, "seen_msg_id": str(seen_msg_id), "seen_at": seen_at}
     except Exception:
         return None
-
 
 def try_parse_message(buf: bytes) -> dict | None:
     try:
         root, _ = parse_thrift(buf, 0)
         outer = root.get(1)
-        if not outer:
-            return None
-
+        if not outer: return None
         sender_id = str(outer.get(3, ""))
-        if not sender_id or not sender_id.isdigit() or not (6 <= len(sender_id) <= 20):
-            return None
-
+        if not sender_id or not sender_id.isdigit() or not (6 <= len(sender_id) <= 20): return None
         conv_id = str(outer.get(4, ""))
-        if ":" not in conv_id:
-            return None
-
+        if ":" not in conv_id: return None
         f7 = outer.get(7)
-        if not f7:
-            return None
+        if not f7: return None
         f1 = f7.get(1)
-        if not f1:
-            return None
-        if f1.get(102) != 1:
-            return None
-
-        msg_id = outer.get(1)
+        if not f1: return None
+        if f1.get(102) != 1: return None
+        msg_id  = outer.get(1)
         sent_at = f1.get(104)
-        if not msg_id or not sent_at:
-            return None
-
-        return {
-            "sender_id": sender_id,
-            "conv_id":   conv_id,
-            "msg_id":    str(msg_id),
-            "sent_at":   sent_at,
-        }
+        if not msg_id or not sent_at: return None
+        return {"sender_id": sender_id, "conv_id": conv_id, "msg_id": str(msg_id), "sent_at": sent_at}
     except Exception:
         return None
 
 # ============================================================
-# TYPING STATE (shared, protected by asyncio single-thread)
+# TYPING STATE
 # ============================================================
 
 class TypingState:
     def __init__(self):
-        self.flags:  dict[str, bool]               = {}
-        self.timers: dict[str, asyncio.TimerHandle] = {}
-
-    def is_typing(self, key: str) -> bool:
-        return self.flags.get(key, False)
-
-    def set_typing(self, key: str, value: bool):
-        self.flags[key] = value
-
-    def get_timer(self, key: str):
-        return self.timers.get(key)
-
-    def set_timer(self, key: str, handle):
-        self.timers[key] = handle
+        self.flags:  dict = {}
+        self.timers: dict = {}
+    def is_typing(self, key): return self.flags.get(key, False)
+    def set_typing(self, key, v): self.flags[key] = v
+    def get_timer(self, key): return self.timers.get(key)
+    def set_timer(self, key, h): self.timers[key] = h
 
 typing = TypingState()
 
 async def on_typing(label: str, key: str, acct_label: str) -> None:
     loop = asyncio.get_event_loop()
-
     if not typing.is_typing(key):
         typing.set_typing(key, True)
         print(f"⌨️  [{now()}] [Acc{acct_label}] {label} is TYPING...")
         await send_ntfy(f"{label} {acct_label} ⌨️", f"{label} is typing...")
-
     old = typing.get_timer(key)
-    if old:
-        old.cancel()
-
+    if old: old.cancel()
     def stop():
         typing.set_typing(key, False)
-        print(
-            f"⏹️  [{now()}] [Acc{acct_label}] {label} STOPPED TYPING.\n"
-            + "--" * 25
-        )
-
+        print(f"⏹️  [{now()}] [Acc{acct_label}] {label} STOPPED TYPING.\n" + "--" * 25)
     typing.set_timer(key, loop.call_later(4.0, stop))
 
 # ============================================================
@@ -308,38 +268,30 @@ async def handle_frame(buf: bytes, account: dict) -> None:
     label = account["LABEL"]
     my_id = account["MY_USER_ID"]
 
-    # ── READ RECEIPT ─────────────────────────────────────────
     seen = try_parse_seen(buf)
     if seen:
-        if seen["reader_id"] == my_id:
-            return
+        if seen["reader_id"] == my_id: return
         name = get_label(seen["reader_id"])
         print(f"👁️  [{now()}] {tag} {name} SEEN your message!")
         await send_ntfy(f"{name} {label} 👁️", f"{name} has seen your message!")
         print("--" * 25)
         return
 
-    # ── NEW MESSAGE ───────────────────────────────────────────
     msg = try_parse_message(buf)
     if msg:
         sender_id = msg["sender_id"]
-
         if sender_id == my_id:
             print(f"↩️  [{now()}] {tag} OUTBOUND IGNORED (sender={sender_id})")
             return
-
-        participants = msg["conv_id"].split(":")
-        if my_id not in participants:
+        if my_id not in msg["conv_id"].split(":"):
             print(f"⚠️  [{now()}] {tag} Message ignored — not a participant.")
             return
-
         name = get_label(sender_id)
         print(f"💬 [{now()}] {tag} {name} sent you a MESSAGE! (id={msg['msg_id']})")
         await send_ntfy(f"{name} {label} 💬", f"{name} sent you a message!")
         print("--" * 25)
         return
 
-    # ── TYPING ────────────────────────────────────────────────
     try:
         raw     = buf.decode("utf-8", errors="replace")
         cleaned = "".join(c if 0x20 <= ord(c) <= 0x7E else " " for c in raw).strip()
@@ -348,14 +300,11 @@ async def handle_frame(buf: bytes, account: dict) -> None:
     except Exception:
         return
 
-    if not typer_id or not typer_id.isdigit() or not (6 <= len(typer_id) <= 20):
-        return
-    if typer_id == my_id:
-        return
+    if not typer_id or not typer_id.isdigit() or not (6 <= len(typer_id) <= 20): return
+    if typer_id == my_id: return
 
-    key  = typer_id
     name = get_label(typer_id)
-    await on_typing(name, key, label)
+    await on_typing(name, typer_id, label)
 
 # ============================================================
 # FETCH WS TOKEN
@@ -363,7 +312,6 @@ async def handle_frame(buf: bytes, account: dict) -> None:
 
 async def fetch_ws_url(account: dict) -> str:
     print(f"[{now()}] 🔄 [Acc{account['LABEL']}] Requesting fresh WS token...")
-
     async with httpx.AsyncClient(timeout=15.0) as client:
         r = await client.post(
             "https://api.x.com/graphql/Qh3fZRjPPtPoHYR_2sCZsA/GenerateXChatTokenMutation",
@@ -379,10 +327,8 @@ async def fetch_ws_url(account: dict) -> str:
             },
             content=json.dumps({"variables": {}}).encode(),
         )
-
     if not r.is_success:
         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-
     data  = r.json()
     token = (
         (data.get("data") or {}).get("user_get_x_chat_auth_token", {}).get("token")
@@ -390,7 +336,6 @@ async def fetch_ws_url(account: dict) -> str:
     )
     if not token:
         raise RuntimeError(f"Token not found in response: {str(data)[:200]}")
-
     return f"wss://chat-ws.x.com/ws?token={token}"
 
 # ============================================================
@@ -403,7 +348,7 @@ async def monitor(account: dict) -> None:
 
     while True:
         attempt += 1
-        backoff = min(1 * (2 ** (attempt - 1)), 60)  # 1s, 2s, 4s … 60s
+        backoff = min(1 * (2 ** (attempt - 1)), 60)
 
         try:
             ws_url = await fetch_ws_url(account)
@@ -415,33 +360,20 @@ async def monitor(account: dict) -> None:
                 "Cookie":     f"auth_token={account['AUTH_TOKEN']}; ct0={account['CT0']};",
             }
 
-            async with websockets.connect(
-                ws_url,
-                extra_headers=headers,
-                ping_interval=25,      # sends WS ping every 25s — keeps Railway alive
-                ping_timeout=10,
-                open_timeout=15,
-            ) as ws:
+            async with make_ws_connect(ws_url, headers) as ws:
                 print(f"[{now()}] 🟢 {tag} ONLINE: Clearing backlog (1s)...")
                 await asyncio.sleep(1)
-                attempt = 0            # reset backoff on successful connect
+                attempt = 0
                 print(f"⚡ {tag} NOW LISTENING\n")
 
                 async for raw in ws:
                     buf = raw if isinstance(raw, bytes) else raw.encode()
-
-                    # Heartbeat — ignore
                     if base64.b64encode(buf).decode() == HEARTBEAT_B64:
                         continue
-
                     await handle_frame(buf, account)
 
         except websockets.exceptions.ConnectionClosed as e:
-            print(
-                f"[{now()}] 🔴 {tag} Disconnected "
-                f"(code={e.code}, reason={e.reason or 'none'}). "
-                f"Reconnecting in {backoff}s..."
-            )
+            print(f"[{now()}] 🔴 {tag} Disconnected (code={e.code}). Reconnecting in {backoff}s...")
         except Exception as e:
             print(f"[{now()}] ❌ {tag} Error: {e}. Retrying in {backoff}s...")
 
