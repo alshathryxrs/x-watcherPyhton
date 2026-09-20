@@ -39,6 +39,52 @@ USER_AGENT = (
 HEARTBEAT_B64 = "DAACDAACAAAA"
 
 # ============================================================
+# PRESENCE — tracks which conversations YOU are actively in
+#
+# Signal                        Action
+# ─────────────────────────────────────────────────────────────
+# Your own read receipt fires   → mark that conv as active
+# Your own typing frame fires   → mark that conv as active
+# Your own message sends        → mark that conv as active
+# No signal from you for 10min  → conv becomes inactive again
+#
+# While a conv is active: suppress ALL notifications for it.
+# Other convs are unaffected.
+# ============================================================
+
+PRESENCE_TIMEOUT = 6          # 6 seconds of silence → resume alerts
+
+# conv_id → asyncio.TimerHandle  (None means not active)
+_presence: dict[str, object] = {}
+
+def _conv_id_for_accounts(my_user_id: str, other_user_id: str) -> str:
+    """X conv IDs are always sorted numerically low:high"""
+    ids = sorted([my_user_id, other_user_id], key=lambda x: int(x))
+    return f"{ids[0]}:{ids[1]}"
+
+def is_muted(conv_id: str) -> bool:
+    return conv_id in _presence
+
+def mark_presence(conv_id: str, my_id: str, reason: str) -> None:
+    """Call whenever YOU interact with a conversation."""
+    loop = asyncio.get_event_loop()
+    was_muted = is_muted(conv_id)
+
+    # Cancel existing timer if any
+    old = _presence.get(conv_id)
+    if old:
+        old.cancel()
+
+    def expire():
+        _presence.pop(conv_id, None)
+        print(f"🔔 [{now()}] Notifications RESUMED for conv {conv_id} (inactive 10min)")
+
+    _presence[conv_id] = loop.call_later(PRESENCE_TIMEOUT, expire)
+
+    if not was_muted:
+        print(f"🔕 [{now()}] Notifications MUTED for conv {conv_id} ({reason})")
+
+# ============================================================
 # HELPERS
 # ============================================================
 
@@ -171,12 +217,15 @@ def try_parse_message(buf):
 _typing_flags  = {}
 _typing_timers = {}
 
-async def on_typing(label: str, key: str, acct_label: str) -> None:
+async def on_typing(label: str, key: str, acct_label: str, conv_id: str) -> None:
     loop = asyncio.get_event_loop()
     if not _typing_flags.get(key):
         _typing_flags[key] = True
         print(f"⌨️  [{now()}] [Acc{acct_label}] {label} is TYPING...")
-        await send_ntfy(f"{label} {acct_label} ⌨️", f"{label} is typing...")
+        if not is_muted(conv_id):
+            asyncio.create_task(send_ntfy(f"{label} {acct_label} ⌨️", f"{label} is typing..."))
+        else:
+            print(f"   🔕 muted — skipped ntfy")
     old = _typing_timers.get(key)
     if old: old.cancel()
     def stop():
@@ -193,35 +242,75 @@ async def handle_frame(buf: bytes, account: dict) -> None:
     lbl   = account["LABEL"]
     my_id = account["MY_USER_ID"]
 
+    # ── READ RECEIPT ─────────────────────────────────────────
     seen = try_parse_seen(buf)
     if seen:
-        if seen["reader_id"] == my_id: return
-        name = get_label(seen["reader_id"])
-        print(f"👁️  [{now()}] {tag} {name} SEEN your message!")
-        await send_ntfy(f"{name} {lbl} 👁️", f"{name} has seen your message!")
-        print("--"*25); return
+        conv_id   = seen["conv_id"]
+        reader_id = seen["reader_id"]
 
+        # YOUR own read receipt → you opened this chat
+        if reader_id == my_id:
+            mark_presence(conv_id, my_id, "you opened the chat")
+            return
+
+        # THEIR read receipt → they saw your message
+        name = get_label(reader_id)
+        print(f"👁️  [{now()}] {tag} {name} SEEN your message!")
+        if not is_muted(conv_id):
+            asyncio.create_task(send_ntfy(f"{name} {lbl} 👁️", f"{name} has seen your message!"))
+        else:
+            print(f"   🔕 muted — skipped ntfy")
+        print("--"*25)
+        return
+
+    # ── NEW MESSAGE ───────────────────────────────────────────
     msg = try_parse_message(buf)
     if msg:
-        sid = msg["sender_id"]
+        sid     = msg["sender_id"]
+        conv_id = msg["conv_id"]
+
+        # YOUR own outbound message → you're actively in this chat
         if sid == my_id:
-            print(f"↩️  [{now()}] {tag} OUTBOUND IGNORED"); return
-        if my_id not in msg["conv_id"].split(":"):
-            print(f"⚠️  [{now()}] {tag} Not a participant."); return
+            mark_presence(conv_id, my_id, "you sent a message")
+            print(f"↩️  [{now()}] {tag} OUTBOUND — presence marked for {conv_id}")
+            return
+
+        if my_id not in conv_id.split(":"):
+            print(f"⚠️  [{now()}] {tag} Not a participant.")
+            return
+
         name = get_label(sid)
         print(f"💬 [{now()}] {tag} {name} sent a MESSAGE!")
-        await send_ntfy(f"{name} {lbl} 💬", f"{name} sent you a message!")
-        print("--"*25); return
+        if not is_muted(conv_id):
+            asyncio.create_task(send_ntfy(f"{name} {lbl} 💬", f"{name} sent you a message!"))
+        else:
+            print(f"   🔕 muted — skipped ntfy")
+        print("--"*25)
+        return
 
+    # ── TYPING ────────────────────────────────────────────────
     try:
-        cleaned = "".join(c if 0x20 <= ord(c) <= 0x7E else " "
-                          for c in buf.decode("utf-8", errors="replace")).strip()
-        typer_id = cleaned.split()[1] if len(cleaned.split()) > 1 else ""
-    except: return
+        cleaned  = "".join(c if 0x20 <= ord(c) <= 0x7E else " "
+                           for c in buf.decode("utf-8", errors="replace")).strip()
+        parts    = cleaned.split()
+        typer_id = parts[1] if len(parts) > 1 else ""
+        # Best-effort conv_id from typing frame (format: "<something> <typer_id> <conv_id?>")
+        raw_conv = parts[2] if len(parts) > 2 else ""
+    except:
+        return
 
     if not typer_id or not typer_id.isdigit() or not (6 <= len(typer_id) <= 20): return
-    if typer_id == my_id: return
-    await on_typing(get_label(typer_id), typer_id, lbl)
+
+    # YOUR own typing → you're in the chat
+    if typer_id == my_id:
+        # Try to get conv_id from frame; fall back to no-op if unavailable
+        if ":" in raw_conv:
+            mark_presence(raw_conv, my_id, "you are typing")
+        return
+
+    # Build conv_id for mute check (sorted pair of IDs)
+    conv_id = _conv_id_for_accounts(my_id, typer_id)
+    await on_typing(get_label(typer_id), typer_id, lbl, conv_id)
 
 # ============================================================
 # FETCH WS TOKEN
@@ -256,7 +345,7 @@ async def fetch_ws_url(account: dict) -> str:
     return f"wss://chat-ws.x.com/ws?token={token}"
 
 # ============================================================
-# MONITOR — uses aiohttp WebSocket (stable API, no version drama)
+# MONITOR
 # ============================================================
 
 async def monitor(account: dict) -> None:
@@ -278,35 +367,41 @@ async def monitor(account: dict) -> None:
             }
 
             async with aiohttp.ClientSession() as session:
-                async with session.ws_connect(
-                    ws_url,
-                    headers=headers,
-                    heartbeat=25,        # aiohttp sends ping every 25s — keeps Railway alive
-                    
-                ) as ws:
-                    print(f"[{now()}] 🟢 {tag} ONLINE: Clearing backlog (1s)...")
-                    await asyncio.sleep(1)
-                    attempt = 0
-                    print(f"⚡ {tag} NOW LISTENING\n")
+                try:
+                    async with session.ws_connect(
+                        ws_url,
+                        headers=headers,
+                        heartbeat=25,
+                        receive_timeout=120,
+                    ) as ws:
+                        print(f"[{now()}] 🟢 {tag} ONLINE: Clearing backlog (1s)...")
+                        await asyncio.sleep(1)
+                        attempt = 0
+                        print(f"⚡ {tag} NOW LISTENING\n")
 
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.BINARY:
-                            buf = msg.data
-                            if base64.b64encode(buf).decode() == HEARTBEAT_B64:
-                                continue
-                            await handle_frame(buf, account)
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.BINARY:
+                                buf = msg.data
+                                if base64.b64encode(buf).decode() == HEARTBEAT_B64:
+                                    continue
+                                await handle_frame(buf, account)
+                            elif msg.type == aiohttp.WSMsgType.TEXT:
+                                await handle_frame(msg.data.encode(), account)
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING):
+                                print(f"[{now()}] 🔴 {tag} WS closed.")
+                                break
+                            elif msg.type == aiohttp.WSMsgType.ERROR:
+                                print(f"[{now()}] ❌ {tag} WS error: {ws.exception()}")
+                                break
 
-                        elif msg.type == aiohttp.WSMsgType.TEXT:
-                            buf = msg.data.encode()
-                            await handle_frame(buf, account)
-
-                        elif msg.type == aiohttp.WSMsgType.CLOSED:
-                            print(f"[{now()}] 🔴 {tag} WS closed. Reconnecting in {backoff}s...")
-                            break
-
-                        elif msg.type == aiohttp.WSMsgType.ERROR:
-                            print(f"[{now()}] ❌ {tag} WS error: {ws.exception()}")
-                            break
+                except (
+                    aiohttp.ClientConnectionError,
+                    aiohttp.ServerDisconnectedError,
+                    aiohttp.WSServerHandshakeError,
+                    ConnectionResetError,
+                    asyncio.TimeoutError,
+                ) as e:
+                    print(f"[{now()}] 🔴 {tag} WS dropped: {e}")
 
         except Exception as e:
             print(f"[{now()}] ❌ {tag} Error: {e}. Retrying in {backoff}s...")
