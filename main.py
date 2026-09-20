@@ -51,7 +51,7 @@ def get_label(sender_id: str) -> str:
         REEM_USER_ID:   "Reem",
         NOORA_USER_ID:  "Noora",
         JAMILA_USER_ID: "Jamila",
-    }.get(sender_id, f"User {sender_id}")
+    }.get(sender_id, "Someone")
 
 # ============================================================
 # NTFY
