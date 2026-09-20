@@ -417,7 +417,7 @@ async def monitor(account: dict) -> None:
 
             async with websockets.connect(
                 ws_url,
-                additional_headers=headers,
+                extra_headers=headers,
                 ping_interval=25,      # sends WS ping every 25s — keeps Railway alive
                 ping_timeout=10,
                 open_timeout=15,
