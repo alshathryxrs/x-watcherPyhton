@@ -6,14 +6,13 @@ import httpx
 import aiohttp
 from datetime import datetime
 
-# ==================== ACCOUNT CREDENTIALS ====================
+# ==================== CREDENTIALS ====================
 ACCOUNT1 = {
     "MY_USER_ID": "704772337",
     "AUTH_TOKEN": "000109a238c22edaed3918aacb3d8c0a4360d480",
     "CT0":        "6fd94ab6e318068f4e34c27c07d5b055541c8447ddc43e14d8ac0cedbe02a6efb5060c89092b47d6e071e61aca37496f44886a1c141abc20bb5aec817f214dcd2fbc7f22f39372ab5a8664ecb553f439",
     "LABEL":      "1",
 }
-
 ACCOUNT2 = {
     "MY_USER_ID": "2050569848002957312",
     "AUTH_TOKEN": "52374ce131bffe2766c9878c792f5e0074a200a1",
@@ -30,59 +29,9 @@ NOORA_USER_ID  = "2082060317358743552"
 JAMILA_USER_ID = "2024978767081254912"
 
 NTFY_TOPIC = "JamilaActivatedHerXAccount"
-
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:155.0) "
-    "Gecko/20100101 Firefox/155.0"
-)
-
-HEARTBEAT_B64 = "DAACDAACAAAA"
-
-# ============================================================
-# PRESENCE — tracks which conversations YOU are actively in
-#
-# Signal                        Action
-# ─────────────────────────────────────────────────────────────
-# Your own read receipt fires   → mark that conv as active
-# Your own typing frame fires   → mark that conv as active
-# Your own message sends        → mark that conv as active
-# No signal from you for 6s → conv becomes inactive again
-#
-# While a conv is active: suppress ALL notifications for it.
-# Other convs are unaffected.
-# ============================================================
-
-PRESENCE_TIMEOUT = 6          # 6 seconds of silence → resume alerts
-
-# conv_id → asyncio.TimerHandle  (None means not active)
-_presence: dict[str, object] = {}
-
-def _conv_id_for_accounts(my_user_id: str, other_user_id: str) -> str:
-    """X conv IDs are always sorted numerically low:high"""
-    ids = sorted([my_user_id, other_user_id], key=lambda x: int(x))
-    return f"{ids[0]}:{ids[1]}"
-
-def is_muted(conv_id: str) -> bool:
-    return conv_id in _presence
-
-def mark_presence(conv_id: str, my_id: str, reason: str) -> None:
-    """Call whenever YOU interact with a conversation."""
-    loop = asyncio.get_event_loop()
-    was_muted = is_muted(conv_id)
-
-    # Cancel existing timer if any
-    old = _presence.get(conv_id)
-    if old:
-        old.cancel()
-
-    def expire():
-        _presence.pop(conv_id, None)
-        print(f"🔔 [{now()}] Notifications RESUMED for conv {conv_id} (inactive 6s)")
-
-    _presence[conv_id] = loop.call_later(PRESENCE_TIMEOUT, expire)
-
-    if not was_muted:
-        print(f"🔕 [{now()}] Notifications MUTED for conv {conv_id} ({reason})")
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:155.0) Gecko/20100101 Firefox/155.0"
+HEARTBEAT_B64   = "DAACDAACAAAA"
+PRESENCE_TIMEOUT = 6  # seconds of your inactivity before notifications resume
 
 # ============================================================
 # HELPERS
@@ -100,12 +49,30 @@ def get_label(sender_id: str) -> str:
     }.get(sender_id, "Someone")
 
 # ============================================================
+# PRESENCE — mute notifications when YOU are in the chat
+# ============================================================
+
+_presence: dict[str, asyncio.TimerHandle] = {}
+
+def mark_presence(conv_id: str) -> None:
+    loop = asyncio.get_event_loop()
+    old  = _presence.get(conv_id)
+    if old:
+        old.cancel()
+    def expire():
+        _presence.pop(conv_id, None)
+    _presence[conv_id] = loop.call_later(PRESENCE_TIMEOUT, expire)
+
+def is_muted(conv_id: str) -> bool:
+    return conv_id in _presence
+
+# ============================================================
 # NTFY
 # ============================================================
 
-async def send_ntfy(title: str, message: str, retries: int = 3) -> None:
+async def send_ntfy(title: str, message: str) -> None:
     rfc2047 = "=?UTF-8?B?" + base64.b64encode(title.encode()).decode() + "?="
-    for attempt in range(1, retries + 1):
+    for attempt in range(1, 4):
         try:
             async with httpx.AsyncClient(timeout=8.0) as client:
                 r = await client.post(
@@ -114,15 +81,11 @@ async def send_ntfy(title: str, message: str, retries: int = 3) -> None:
                     headers={"Content-Type": "text/plain; charset=utf-8", "Title": rfc2047},
                 )
             if r.is_success:
-                if attempt > 1:
-                    print(f"[{now()}] ✅ ntfy ok on attempt {attempt}")
                 return
-            print(f"[{now()}] ntfy HTTP {r.status_code} attempt {attempt}/{retries}")
         except Exception as e:
-            print(f"[{now()}] ntfy failed attempt {attempt}/{retries}: {e}")
-        if attempt < retries:
+            print(f"[{now()}] ntfy attempt {attempt}/3 failed: {type(e).__name__}: {e}")
+        if attempt < 3:
             await asyncio.sleep(2 * attempt)
-    print(f"[{now()}] ❌ ntfy gave up — {title!r}")
 
 # ============================================================
 # THRIFT PARSER
@@ -187,8 +150,7 @@ def try_parse_seen(buf):
         f7 = outer.get(7)
         if not f7: return None
         f12 = f7.get(12)
-        if not f12: return None
-        if not f12.get(1) or not f12.get(2): return None
+        if not f12 or not f12.get(1) or not f12.get(2): return None
         return {"reader_id": rid, "conv_id": cid}
     except: return None
 
@@ -214,23 +176,19 @@ def try_parse_message(buf):
 # TYPING STATE
 # ============================================================
 
-_typing_flags  = {}
-_typing_timers = {}
+_typing_flags:  dict = {}
+_typing_timers: dict = {}
 
-async def on_typing(label: str, key: str, acct_label: str, conv_id: str) -> None:
+async def on_typing(label: str, key: str, acct_label: str) -> None:
     loop = asyncio.get_event_loop()
     if not _typing_flags.get(key):
         _typing_flags[key] = True
-        print(f"⌨️  [{now()}] [Acc{acct_label}] {label} is TYPING...")
-        if not is_muted(conv_id):
+        if not is_muted(key):
             asyncio.create_task(send_ntfy(f"{label} {acct_label} ⌨️", f"{label} is typing..."))
-        else:
-            print(f"   🔕 muted — skipped ntfy")
     old = _typing_timers.get(key)
     if old: old.cancel()
     def stop():
         _typing_flags[key] = False
-        print(f"⏹️  [{now()}] [Acc{acct_label}] {label} STOPPED TYPING.\n" + "--"*25)
     _typing_timers[key] = loop.call_later(4.0, stop)
 
 # ============================================================
@@ -238,86 +196,55 @@ async def on_typing(label: str, key: str, acct_label: str, conv_id: str) -> None
 # ============================================================
 
 async def handle_frame(buf: bytes, account: dict) -> None:
-    tag   = f"[Acc{account['LABEL']}]"
     lbl   = account["LABEL"]
     my_id = account["MY_USER_ID"]
 
-    # ── READ RECEIPT ─────────────────────────────────────────
+    # ── READ RECEIPT ──────────────────────────────────────────
     seen = try_parse_seen(buf)
     if seen:
-        conv_id   = seen["conv_id"]
-        reader_id = seen["reader_id"]
-
-        # YOUR own read receipt → you opened this chat
-        if reader_id == my_id:
-            mark_presence(conv_id, my_id, "you opened the chat")
+        if seen["reader_id"] == my_id:
+            mark_presence(seen["conv_id"])  # YOU opened the chat → mute
             return
-
-        # THEIR read receipt → they saw your message
-        name = get_label(reader_id)
-        print(f"👁️  [{now()}] {tag} {name} SEEN your message!")
-        if not is_muted(conv_id):
-            asyncio.create_task(send_ntfy(f"{name} {lbl} 👁️", f"{name} has seen your message!"))
-        else:
-            print(f"   🔕 muted — skipped ntfy")
-        print("--"*25)
+        if is_muted(seen["conv_id"]): return
+        name = get_label(seen["reader_id"])
+        asyncio.create_task(send_ntfy(f"{name} {lbl} 👁️", f"{name} has seen your message!"))
         return
 
     # ── NEW MESSAGE ───────────────────────────────────────────
     msg = try_parse_message(buf)
     if msg:
-        sid     = msg["sender_id"]
-        conv_id = msg["conv_id"]
-
-        # YOUR own outbound message → you're actively in this chat
+        sid = msg["sender_id"]
         if sid == my_id:
-            mark_presence(conv_id, my_id, "you sent a message")
-            print(f"↩️  [{now()}] {tag} OUTBOUND — presence marked for {conv_id}")
+            mark_presence(msg["conv_id"])  # YOU sent → mute
             return
-
-        if my_id not in conv_id.split(":"):
-            print(f"⚠️  [{now()}] {tag} Not a participant.")
-            return
-
+        if my_id not in msg["conv_id"].split(":"): return
+        if is_muted(msg["conv_id"]): return
         name = get_label(sid)
-        print(f"💬 [{now()}] {tag} {name} sent a MESSAGE!")
-        if not is_muted(conv_id):
-            asyncio.create_task(send_ntfy(f"{name} {lbl} 💬", f"{name} sent you a message!"))
-        else:
-            print(f"   🔕 muted — skipped ntfy")
-        print("--"*25)
+        asyncio.create_task(send_ntfy(f"{name} {lbl} 💬", f"{name} sent you a message!"))
         return
 
     # ── TYPING ────────────────────────────────────────────────
     try:
         cleaned  = "".join(c if 0x20 <= ord(c) <= 0x7E else " "
                            for c in buf.decode("utf-8", errors="replace")).strip()
-        parts    = cleaned.split()
-        typer_id = parts[1] if len(parts) > 1 else ""
-        # Best-effort conv_id from typing frame (format: "<something> <typer_id> <conv_id?>")
-        raw_conv = parts[2] if len(parts) > 2 else ""
-    except:
-        return
+        typer_id = cleaned.split()[1] if len(cleaned.split()) > 1 else ""
+    except: return
 
     if not typer_id or not typer_id.isdigit() or not (6 <= len(typer_id) <= 20): return
 
-    # YOUR own typing → you're in the chat
     if typer_id == my_id:
-        # Try to get conv_id from frame; fall back to no-op if unavailable
-        if ":" in raw_conv:
-            mark_presence(raw_conv, my_id, "you are typing")
+        # YOUR typing frame — find conv from cleaned text if possible, else skip
+        mark_presence(typer_id)  # best effort presence signal
         return
 
-    # Build conv_id for mute check (sorted pair of IDs)
-    conv_id = _conv_id_for_accounts(my_id, typer_id)
-    await on_typing(get_label(typer_id), typer_id, lbl, conv_id)
+    if is_muted(typer_id): return
+    await on_typing(get_label(typer_id), typer_id, lbl)
 
 # ============================================================
 # FETCH WS TOKEN
 # ============================================================
 
 async def fetch_ws_url(account: dict) -> str:
-    print(f"[{now()}] 🔄 [Acc{account['LABEL']}] Requesting fresh WS token...")
     async with httpx.AsyncClient(timeout=15.0) as client:
         r = await client.post(
             "https://api.x.com/graphql/Qh3fZRjPPtPoHYR_2sCZsA/GenerateXChatTokenMutation",
@@ -334,14 +261,14 @@ async def fetch_ws_url(account: dict) -> str:
             content=json.dumps({"variables": {}}).encode(),
         )
     if not r.is_success:
-        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+        raise RuntimeError(f"Token fetch failed: HTTP {r.status_code}")
     data  = r.json()
     token = (
         (data.get("data") or {}).get("user_get_x_chat_auth_token", {}).get("token")
         or data.get("user_get_x_chat_auth_token", {}).get("token")
     )
     if not token:
-        raise RuntimeError(f"Token not found: {str(data)[:200]}")
+        raise RuntimeError("Token not found in response")
     return f"wss://chat-ws.x.com/ws?token={token}"
 
 # ============================================================
@@ -354,69 +281,68 @@ async def monitor(account: dict) -> None:
 
     while True:
         attempt += 1
-        backoff = min(1 * (2 ** (attempt - 1)), 60)
+        backoff = min(2 ** (attempt - 1), 60)
 
         try:
             ws_url = await fetch_ws_url(account)
-            print(f"[{now()}] ✅ {tag} Token acquired! Connecting...")
 
-            headers = {
-                "User-Agent": USER_AGENT,
-                "Origin":     "https://x.com",
-                "Cookie":     f"auth_token={account['AUTH_TOKEN']}; ct0={account['CT0']};",
-            }
+            # NO heartbeat — let the server's own frames keep it alive.
+            # aiohttp heartbeat was crashing the socket on Railway.
+            connector = aiohttp.TCPConnector(force_close=False, enable_cleanup_closed=True)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.ws_connect(
+                    ws_url,
+                    headers={
+                        "User-Agent": USER_AGENT,
+                        "Origin":     "https://x.com",
+                        "Cookie":     f"auth_token={account['AUTH_TOKEN']}; ct0={account['CT0']};",
+                    },
+                    receive_timeout=90,   # reconnect if silent >90s
+                    autoclose=True,
+                    autoping=True,        # respond to server pings — keeps socket alive
+                ) as ws:
+                    print(f"[{now()}] 🟢 {tag} CONNECTED")
+                    await asyncio.sleep(1)  # drain backlog
+                    attempt = 0
 
-            async with aiohttp.ClientSession() as session:
-                try:
-                    async with session.ws_connect(
-                        ws_url,
-                        headers=headers,
-                        heartbeat=25,
-                        receive_timeout=120,
-                    ) as ws:
-                        print(f"[{now()}] 🟢 {tag} ONLINE: Clearing backlog (1s)...")
-                        await asyncio.sleep(1)
-                        attempt = 0
-                        print(f"⚡ {tag} NOW LISTENING\n")
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.BINARY:
+                            buf = msg.data
+                            if base64.b64encode(buf).decode() == HEARTBEAT_B64:
+                                continue
+                            await handle_frame(buf, account)
 
-                        async for msg in ws:
-                            if msg.type == aiohttp.WSMsgType.BINARY:
-                                buf = msg.data
-                                if base64.b64encode(buf).decode() == HEARTBEAT_B64:
-                                    continue
-                                await handle_frame(buf, account)
-                            elif msg.type == aiohttp.WSMsgType.TEXT:
-                                await handle_frame(msg.data.encode(), account)
-                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING):
-                                print(f"[{now()}] 🔴 {tag} WS closed.")
-                                break
-                            elif msg.type == aiohttp.WSMsgType.ERROR:
-                                print(f"[{now()}] ❌ {tag} WS error: {ws.exception()}")
-                                break
+                        elif msg.type == aiohttp.WSMsgType.TEXT:
+                            await handle_frame(msg.data.encode(), account)
 
-                except (
-                    aiohttp.ClientConnectionError,
-                    aiohttp.ServerDisconnectedError,
-                    aiohttp.WSServerHandshakeError,
-                    ConnectionResetError,
-                    asyncio.TimeoutError,
-                ) as e:
-                    print(f"[{now()}] 🔴 {tag} WS dropped: {e}")
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING):
+                            print(f"[{now()}] 🔴 {tag} WS closed — reconnecting in {backoff}s")
+                            break
 
+                        elif msg.type == aiohttp.WSMsgType.ERROR:
+                            print(f"[{now()}] ❌ {tag} WS error: {ws.exception()} — reconnecting in {backoff}s")
+                            break
+
+        except asyncio.TimeoutError:
+            print(f"[{now()}] ⏱ {tag} No data for 90s — reconnecting in {backoff}s")
         except Exception as e:
-            print(f"[{now()}] ❌ {tag} Error: {e}. Retrying in {backoff}s...")
+            print(f"[{now()}] ❌ {tag} {type(e).__name__}: {e} — reconnecting in {backoff}s")
 
         await asyncio.sleep(backoff)
 
 # ============================================================
-# ENTRY POINT
+# ENTRY POINT — return_exceptions=True prevents silent death
 # ============================================================
 
 async def main():
-    await asyncio.gather(
+    results = await asyncio.gather(
         monitor(ACCOUNT1),
         monitor(ACCOUNT2),
+        return_exceptions=True,
     )
+    for i, r in enumerate(results, 1):
+        if isinstance(r, Exception):
+            print(f"[{now()}] 💀 Account {i} died: {r}")
 
 if __name__ == "__main__":
     asyncio.run(main())
