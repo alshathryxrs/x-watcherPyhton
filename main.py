@@ -46,7 +46,7 @@ HEARTBEAT_B64 = "DAACDAACAAAA"
 # Your own read receipt fires   → mark that conv as active
 # Your own typing frame fires   → mark that conv as active
 # Your own message sends        → mark that conv as active
-# No signal from you for 10min  → conv becomes inactive again
+# No signal from you for 6s → conv becomes inactive again
 #
 # While a conv is active: suppress ALL notifications for it.
 # Other convs are unaffected.
@@ -77,7 +77,7 @@ def mark_presence(conv_id: str, my_id: str, reason: str) -> None:
 
     def expire():
         _presence.pop(conv_id, None)
-        print(f"🔔 [{now()}] Notifications RESUMED for conv {conv_id} (inactive 10min)")
+        print(f"🔔 [{now()}] Notifications RESUMED for conv {conv_id} (inactive 6s)")
 
     _presence[conv_id] = loop.call_later(PRESENCE_TIMEOUT, expire)
 
