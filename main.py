@@ -28,7 +28,8 @@ REEM_USER_ID   = "954222428791681025"
 NOORA_USER_ID  = "2082060317358743552"
 JAMILA_USER_ID = "2024978767081254912"
 
-NTFY_TOPIC = "JamilaActivatedHerXAccount"
+TELEGRAM_TOKEN   = "8728595372:AAHL9A3WtjGGQ4042R3OoLPK5XN4IZs70vM"
+TELEGRAM_CHAT_ID = "6607397366"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:155.0) Gecko/20100101 Firefox/155.0"
 HEARTBEAT_B64   = "DAACDAACAAAA"
 PRESENCE_TIMEOUT = 6  # seconds of your inactivity before notifications resume
@@ -71,19 +72,20 @@ def is_muted(conv_id: str) -> bool:
 # ============================================================
 
 async def send_ntfy(title: str, message: str) -> None:
-    rfc2047 = "=?UTF-8?B?" + base64.b64encode(title.encode()).decode() + "?="
+    text = f"*{title}*\n{message}"
+    url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     for attempt in range(1, 4):
         try:
             async with httpx.AsyncClient(timeout=8.0) as client:
-                r = await client.post(
-                    f"https://ntfy.sh/{NTFY_TOPIC}",
-                    content=message.encode(),
-                    headers={"Content-Type": "text/plain; charset=utf-8", "Title": rfc2047},
-                )
+                r = await client.post(url, json={
+                    "chat_id":    TELEGRAM_CHAT_ID,
+                    "text":       text,
+                    "parse_mode": "Markdown",
+                })
             if r.is_success:
                 return
         except Exception as e:
-            print(f"[{now()}] ntfy attempt {attempt}/3 failed: {type(e).__name__}: {e}")
+            print(f"[{now()}] Telegram attempt {attempt}/3 failed: {type(e).__name__}: {e}")
         if attempt < 3:
             await asyncio.sleep(2 * attempt)
 
